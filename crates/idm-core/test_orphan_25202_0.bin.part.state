@@ -1,0 +1,9 @@
+{
+  "original_url": "http://127.0.0.1:55244/testfile",
+  "final_url": "http://127.0.0.1:55244/testfile",
+  "total_size": 32768,
+  "etag": "\"etag\"",
+  "last_modified": null,
+  "chunk_size": 16384,
+  "completed_chunks": []
+}

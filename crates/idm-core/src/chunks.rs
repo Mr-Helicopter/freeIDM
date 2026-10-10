@@ -66,11 +66,11 @@ pub fn calculate_chunks(total_size: u64, chunk_size: u64) -> Vec<Chunk> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]
-    fn test_calculate_chunks_edge_cases() {
+    pub fn test_calculate_chunks_edge_cases() {
         // 1. Smaller than chunk size: 15 bytes with 64 byte chunk size -> 1 chunk [0..14]
         let chunks = calculate_chunks(15, 64);
         assert_eq!(chunks.len(), 1);

@@ -17,7 +17,9 @@
 
 use anyhow::{Context, Result};
 use percent_encoding::percent_decode_str;
-use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE};
+use reqwest::header::{
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE,
+};
 use reqwest::{StatusCode, Url};
 
 /// Information gathered during server probing.
@@ -38,10 +40,6 @@ pub struct ProbeInfo {
 }
 
 /// Sanitizes a filename to prevent Directory Traversal attacks (CWE-22).
-///
-/// Untrusted inputs from servers or URLs might include malicious paths like
-/// `../../etc/passwd` or `C:\bad\file.exe`. This function extracts only the safe
-/// base filename, stripping path separators and quotes.
 pub fn sanitize_filename(raw_name: &str) -> Option<String> {
     let trimmed = raw_name.trim().trim_matches('"').trim_matches('\'');
     let normalized = trimmed.replace('\\', "/");
@@ -155,9 +153,9 @@ pub fn verify_content_range(header_val: &str, expected_start: u64, expected_end:
 }
 
 /// Probes the server to extract size, range capabilities, and metadata.
+///
+/// No stdout/stderr printing is performed in idm-core.
 pub async fn probe_server(client: &reqwest::Client, url: &Url) -> Result<ProbeInfo> {
-    println!("Probing server at {} ...", url);
-
     // Step A: Attempt lightweight HEAD request
     let head_result = client.head(url.clone()).send().await;
 
@@ -171,7 +169,15 @@ pub async fn probe_server(client: &reqwest::Client, url: &Url) -> Result<ProbeIn
             .map(|s| s.eq_ignore_ascii_case("bytes"))
             .unwrap_or(false);
 
-        let content_length = resp.content_length();
+        // Reqwest returns Some(0) for resp.content_length() on HEAD requests
+        // because HEAD bodies are empty. We extract the actual entity size from Content-Length header.
+        let content_length = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| resp.content_length());
+
         let etag = resp
             .headers()
             .get(ETAG)
@@ -185,7 +191,6 @@ pub async fn probe_server(client: &reqwest::Client, url: &Url) -> Result<ProbeIn
         let filename = determine_filename(resp.headers(), resp.url());
         let final_url = resp.url().clone();
 
-        // If HEAD succeeded and provided range support and content length, probe is complete!
         if accepts_ranges && content_length.is_some_and(|len| len > 0) {
             return Ok(ProbeInfo {
                 total_size: content_length,
@@ -199,7 +204,6 @@ pub async fn probe_server(client: &reqwest::Client, url: &Url) -> Result<ProbeIn
     }
 
     // Step B: Fallback to GET with Range: bytes=0-0
-    println!("HEAD request inconclusive. Probing with 'Range: bytes=0-0' ...");
     let range_resp = client
         .get(url.clone())
         .header(RANGE, "bytes=0-0")
@@ -221,7 +225,6 @@ pub async fn probe_server(client: &reqwest::Client, url: &Url) -> Result<ProbeIn
         .map(|s| s.to_string());
 
     if range_resp.status() == StatusCode::PARTIAL_CONTENT {
-        // 206 Partial Content confirms range support!
         let total_size = range_resp
             .headers()
             .get(CONTENT_RANGE)
@@ -239,7 +242,6 @@ pub async fn probe_server(client: &reqwest::Client, url: &Url) -> Result<ProbeIn
             final_url,
         })
     } else {
-        // Server returned 200 OK or another status: range requests are unsupported
         let total_size = range_resp.content_length();
         Ok(ProbeInfo {
             total_size,
@@ -253,11 +255,11 @@ pub async fn probe_server(client: &reqwest::Client, url: &Url) -> Result<ProbeIn
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]
-    fn test_sanitize_filename() {
+    pub fn test_sanitize_filename() {
         assert_eq!(sanitize_filename("file.txt"), Some("file.txt".to_string()));
         assert_eq!(sanitize_filename("\"quoted.iso\""), Some("quoted.iso".to_string()));
         assert_eq!(sanitize_filename("../../etc/shadow"), Some("shadow".to_string()));
@@ -268,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_content_disposition() {
+    pub fn test_parse_content_disposition() {
         let regular = r#"attachment; filename="archive.tar.gz""#;
         assert_eq!(parse_content_disposition(regular), Some("archive.tar.gz".to_string()));
 
@@ -280,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_content_range_total() {
+    pub fn test_parse_content_range_total() {
         assert_eq!(parse_content_range_total("bytes 0-0/10485760"), Some(10485760));
         assert_eq!(parse_content_range_total("bytes 100-200/5000"), Some(5000));
         assert_eq!(parse_content_range_total("bytes 0-0/*"), None);
@@ -288,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_content_range() {
+    pub fn test_verify_content_range() {
         assert!(verify_content_range("bytes 0-4194303/10000000", 0, 4194303));
         assert!(verify_content_range("bytes 4194304-8388607/10000000", 4194304, 8388607));
         assert!(!verify_content_range("bytes 0-1000/10000000", 0, 999));
