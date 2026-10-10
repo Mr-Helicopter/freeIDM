@@ -1,399 +1,512 @@
-//! # Rust CLI File Downloader
+//! # IDM - Parallel Segmented CLI File Downloader in Rust
 //!
-//! A fast, asynchronous command-line file downloader inspired by IDM / wget / curl.
+//! A modular, high-performance command-line file downloader inspired by IDM.
 //!
-//! Features:
-//! - Asynchronous HTTP streaming using `reqwest` and `tokio`.
-//! - Streams chunks directly to disk to prevent high memory (RAM) usage.
-//! - Extracts filename automatically from `Content-Disposition` header or the URL path.
-//! - Visual progress bar with download speed, ETA, and byte counters using `indicatif`.
-//! - Comprehensive error handling using `anyhow`.
+//! ## Modules:
+//! - [`probe`]: Server capability discovery, HEAD / GET 0-0 probing, filename sanitization.
+//! - [`chunks`]: Byte range partitioning with inclusive HTTP range bounds.
+//! - [`segmented`]: Multi-connection parallel downloading, work queue, and retries.
+//! - [`single`]: Stage 1 single-stream fallback with explicit file truncation.
+//! - [`progress`]: Indicatif progress bar styling and initialization.
+
+pub mod chunks;
+pub mod probe;
+pub mod progress;
+pub mod segmented;
+pub mod single;
 
 use std::env;
-use std::path::Path;
-use std::time::Duration;
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
-use percent_encoding::percent_decode_str;
-use reqwest::header::{CONTENT_DISPOSITION, HeaderMap};
+use indicatif::HumanBytes;
 use reqwest::Url;
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+
+use crate::probe::probe_server;
+use crate::segmented::{download_segmented, ChunkError, DEFAULT_CHUNK_SIZE, DEFAULT_CONNECTIONS};
+use crate::single::download_single_stream;
 
 // ============================================================================
-// SECTION 1: Filename Extraction & Security Sanitization
+// CLI Configuration & Argument Parsing
 // ============================================================================
 
-/// Sanitizes a filename string to prevent Directory Traversal attacks (CWE-22).
-///
-/// In security, untrusted inputs (like server headers or URLs) might contain paths
-/// such as `../../etc/passwd` or `C:\Windows\System32\cmd.exe`.
-/// This helper extracts only the final file component, stripping any directory
-/// separators (both `/` and `\`) and surrounding quotes or whitespace.
-fn sanitize_filename(raw_name: &str) -> Option<String> {
-    // 1. Strip whitespace and quotes that often wrap header values
-    let trimmed = raw_name.trim().trim_matches('"').trim_matches('\'');
-
-    // 2. Normalize Windows backslashes (`\`) to forward slashes (`/`)
-    //    so this works uniformly across Windows, macOS, and Linux.
-    let normalized = trimmed.replace('\\', "/");
-
-    // 3. Take the last non-empty component after the last slash
-    let base = normalized.split('/').rfind(|s| !s.is_empty())?;
-    let base = base.trim();
-
-    // 4. Reject dangerous special directory names like "." or ".."
-    if base.is_empty() || base == "." || base == ".." {
-        None
-    } else {
-        Some(base.to_string())
-    }
+/// Stores the user's parsed command-line configuration options.
+#[derive(Debug, Clone)]
+pub struct CliConfig {
+    /// The target HTTP/HTTPS URL.
+    pub url: String,
+    /// Number of concurrent worker connections (default 8).
+    pub connections: usize,
+    /// Size of each chunk in bytes (default 4 MiB).
+    pub chunk_size: u64,
+    /// Optional output file path override (useful in unit/integration tests).
+    pub output_path: Option<PathBuf>,
 }
 
-/// Parses the `Content-Disposition` HTTP header to extract the recommended filename.
-///
-/// RFC 6266 and RFC 5987 define how headers convey filenames:
-/// - `filename="example.zip"` (standard parameter)
-/// - `filename*=UTF-8''example%20file.zip` (extended parameter with charset & percent-encoding)
-///
-/// If both are present, RFC 6266 specifies that `filename*` takes precedence.
-fn parse_content_disposition(header_val: &str) -> Option<String> {
-    let mut regular_filename = None;
-    let mut star_filename = None;
-
-    // Parameters are separated by semicolons (e.g. `attachment; filename="test.pdf"`)
-    for part in header_val.split(';') {
-        let part = part.trim();
-
-        // Split key and value on the first '=' character
-        if let Some((key, val)) = part.split_once('=') {
-            let key = key.trim().to_ascii_lowercase();
-            let val = val.trim();
-
-            if key == "filename*" {
-                // Extended format: charset'lang'encoded_value (e.g. UTF-8''%e2%82%ac%20rates.pdf)
-                let encoded_part = if let Some((_, encoded)) = val.split_once("''") {
-                    encoded
-                } else {
-                    val
-                };
-
-                // Decode percent-encoded characters (like %20 -> space)
-                if let Ok(decoded) = percent_decode_str(encoded_part).decode_utf8() {
-                    star_filename = sanitize_filename(&decoded);
-                }
-            } else if key == "filename" {
-                // Standard format: filename="test.zip" or filename=test.zip
-                regular_filename = sanitize_filename(val);
-            }
-        }
-    }
-
-    // Prefer `filename*` over `filename`, as recommended by RFC 6266
-    star_filename.or(regular_filename)
-}
-
-/// Extracts a filename from the URL path.
-///
-/// For example:
-/// - `https://example.com/downloads/v1.2.0/app.tar.gz` -> `app.tar.gz`
-/// - `https://example.com/files/hello%20world.txt?token=xyz` -> `hello world.txt`
-fn parse_url_filename(url: &Url) -> Option<String> {
-    // `path_segments()` yields an iterator of path slices between '/'
-    let last_segment = url.path_segments()?.rfind(|s| !s.is_empty())?;
-
-    // Percent-decode the segment (e.g., `%20` becomes a space ` `)
-    let decoded = percent_decode_str(last_segment).decode_utf8().ok()?;
-
-    sanitize_filename(&decoded)
-}
-
-/// Determines the best filename for saving the download.
-///
-/// Priority:
-/// 1. `Content-Disposition` response header (if provided by server)
-/// 2. URL path segment (from the final URL after any redirects)
-/// 3. Default fallback: `"downloaded_file"`
-fn determine_filename(headers: &HeaderMap, url: &Url) -> String {
-    // 1. Try Content-Disposition header
-    if let Some(name) = headers
-        .get(CONTENT_DISPOSITION)
-        .and_then(|val| val.to_str().ok())
-        .and_then(parse_content_disposition)
-    {
-        return name;
-    }
-
-    // 2. Try the URL path
-    if let Some(name) = parse_url_filename(url) {
-        return name;
-    }
-
-    // 3. Fallback when neither contains a valid filename (e.g. root URL `https://example.com/`)
-    "downloaded_file".to_string()
-}
-
-// ============================================================================
-// SECTION 2: Progress Bar Configuration
-// ============================================================================
-
-/// Creates and configures an `indicatif::ProgressBar`.
-///
-/// If the server provided a `Content-Length` header (`total_size` is Some):
-/// - A bounded progress bar is displayed showing:
-///   - Spinner icon
-///   - Elapsed time
-///   - Progress visual bar (`[====>---]`)
-///   - Downloaded bytes / Total bytes
-///   - Current transfer speed (e.g., 5.2 MB/s)
-///   - Estimated time of arrival (ETA)
-///
-/// If the server uses chunked transfer encoding (`total_size` is None):
-/// - An unbounded spinner is displayed showing bytes downloaded and current speed.
-fn setup_progress_bar(total_size: Option<u64>) -> Result<ProgressBar> {
-    match total_size {
-        Some(total) => {
-            let pb = ProgressBar::new(total);
-
-            // Progress bar template documentation:
-            // {spinner:.green}      - Animated spinner in green
-            // [{elapsed_precise}]   - Elapsed time in HH:MM:SS format
-            // [{bar:40.cyan/blue}]  - Progress bar 40 characters wide with cyan filled & blue background
-            // {bytes}/{total_bytes} - Transferred bytes / Total bytes (formatted with units like MB)
-            // {bytes_per_sec}       - Transfer rate in bytes/sec (auto formatted)
-            // {eta}                 - Estimated time remaining
-            let style = ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-                .context("Failed to compile progress bar template")?
-                .progress_chars("#>-");
-
-            pb.set_style(style);
-            pb.enable_steady_tick(Duration::from_millis(100));
-            Ok(pb)
-        }
-        None => {
-            let pb = ProgressBar::new_spinner();
-
-            let style = ProgressStyle::default_spinner()
-                .template("{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})")
-                .context("Failed to compile spinner template")?;
-
-            pb.set_style(style);
-            pb.enable_steady_tick(Duration::from_millis(100));
-            Ok(pb)
-        }
-    }
-}
-
-// ============================================================================
-// SECTION 3: Main Asynchronous Entry Point
-// ============================================================================
-
-/// `#[tokio::main]` initializes the asynchronous Tokio runtime and wraps `main`.
-/// Any function marked `async` can use `.await` to pause execution non-blockingly
-/// until an asynchronous operation (like a network read or disk write) completes.
-///
-/// `anyhow::Result<()>` allows using the `?` operator to return early with an error
-/// while providing detailed contextual information with `.with_context(...)`.
-#[tokio::main]
-async fn main() -> Result<()> {
-    // ------------------------------------------------------------------------
-    // Step 1: Read Command-Line Arguments
-    // ------------------------------------------------------------------------
-    let args: Vec<String> = env::args().collect();
-
-    // Check if the user ran the program without arguments or asked for help
-    if args.len() < 2 || args[1] == "--help" || args[1] == "-h" {
-        println!("IDM - Rust CLI File Downloader");
-        println!();
-        println!("Usage:");
-        println!("  {} <URL>", args[0]);
-        println!();
-        println!("Example:");
-        println!("  {} https://speed.hetzner.de/100MB.bin", args[0]);
-
+impl CliConfig {
+    /// Parses CLI arguments from a slice of strings.
+    pub fn parse_from_args(args: &[String]) -> Result<Option<Self>> {
         if args.len() < 2 {
+            Self::print_help(&args[0]);
             bail!("Error: Missing required <URL> argument.");
         }
-        return Ok(());
+
+        let mut url: Option<String> = None;
+        let mut connections = DEFAULT_CONNECTIONS;
+        let mut chunk_size = DEFAULT_CHUNK_SIZE;
+        let mut output_path = None;
+
+        let mut i = 1;
+        while i < args.len() {
+            let arg = &args[i];
+            if arg == "--help" || arg == "-h" {
+                Self::print_help(&args[0]);
+                return Ok(None);
+            } else if arg == "--connections" || arg == "-c" {
+                i += 1;
+                if i >= args.len() {
+                    bail!("Error: Flag '{}' requires a numerical value.", arg);
+                }
+                connections = args[i]
+                    .parse::<usize>()
+                    .with_context(|| format!("Invalid connections count '{}'", args[i]))?;
+                if connections == 0 {
+                    bail!("Error: Connections count must be at least 1.");
+                }
+            } else if arg == "--chunk-size" || arg == "-s" {
+                i += 1;
+                if i >= args.len() {
+                    bail!("Error: Flag '{}' requires a byte size value.", arg);
+                }
+                chunk_size = args[i]
+                    .parse::<u64>()
+                    .with_context(|| format!("Invalid chunk size '{}'", args[i]))?;
+                if chunk_size == 0 {
+                    bail!("Error: Chunk size must be greater than 0.");
+                }
+            } else if arg == "--output" || arg == "-o" {
+                i += 1;
+                if i >= args.len() {
+                    bail!("Error: Flag '{}' requires a file path.", arg);
+                }
+                output_path = Some(PathBuf::from(&args[i]));
+            } else if arg.starts_with('-') {
+                bail!("Unknown flag '{}'. Run with --help for usage.", arg);
+            } else if url.is_none() {
+                url = Some(arg.clone());
+            } else {
+                bail!("Unexpected additional argument '{}'.", arg);
+            }
+            i += 1;
+        }
+
+        let url = url.context("Error: No URL provided.")?;
+
+        Ok(Some(CliConfig {
+            url,
+            connections,
+            chunk_size,
+            output_path,
+        }))
     }
 
-    let url_input = &args[1];
+    /// Prints a friendly help message explaining usage and options.
+    pub fn print_help(program_name: &str) {
+        println!("IDM - Rust Parallel Segmented CLI File Downloader");
+        println!();
+        println!("Usage:");
+        println!("  {} [OPTIONS] <URL>", program_name);
+        println!();
+        println!("Options:");
+        println!("  -c, --connections <N>   Number of concurrent connections (default: {})", DEFAULT_CONNECTIONS);
+        println!("  -s, --chunk-size <B>    Fixed chunk size in bytes (default: {} [4 MiB])", DEFAULT_CHUNK_SIZE);
+        println!("  -o, --output <PATH>     Destination file path (default: auto-detected)");
+        println!("  -h, --help              Print this help information");
+        println!();
+        println!("Examples:");
+        println!("  {} https://speed.hetzner.de/100MB.bin", program_name);
+        println!("  {} -c 16 https://speed.hetzner.de/100MB.bin", program_name);
+    }
+}
 
-    // Parse and validate the input URL
-    let url = Url::parse(url_input)
-        .with_context(|| format!("Invalid URL '{}'. Please provide a full URL with scheme (e.g., https://...)", url_input))?;
+// ============================================================================
+// Main Orchestration
+// ============================================================================
+
+/// Coordinates probing, method selection (segmented vs single-stream), and fallback.
+pub async fn run_downloader(config: CliConfig) -> Result<()> {
+    let url = Url::parse(&config.url)
+        .with_context(|| format!("Invalid URL '{}'. Please include protocol (https://...)", config.url))?;
 
     if url.scheme() != "http" && url.scheme() != "https" {
-        bail!("Unsupported protocol '{}'. Only 'http' and 'https' are supported.", url.scheme());
+        bail!("Unsupported URL scheme '{}'. Only http and https are supported.", url.scheme());
     }
 
-    // ------------------------------------------------------------------------
-    // Step 2: Initialize HTTP Client & Send Request
-    // ------------------------------------------------------------------------
-    println!("Connecting to {} ...", url);
-
-    // Build an HTTP client with a descriptive User-Agent
     let client = reqwest::Client::builder()
-        .user_agent("idm-cli/0.1.0")
+        .user_agent("idm-cli/0.2.0")
         .build()
         .context("Failed to build HTTP client")?;
 
-    // Send the GET request asynchronously
-    // reqwest follows HTTP redirects (301, 302, 307, 308) automatically by default.
-    let response = client
-        .get(url.clone())
-        .send()
-        .await
-        .with_context(|| format!("Failed to connect to '{}'", url))?;
+    // 1. Probe the server
+    let probe = probe_server(&client, &url).await?;
 
-    // Verify HTTP status code (checks for 404, 500, etc.)
-    let response = response
-        .error_for_status()
-        .context("Server returned an HTTP error status")?;
-
-    // ------------------------------------------------------------------------
-    // Step 3: Determine Destination Filename & File Size
-    // ------------------------------------------------------------------------
-    // Notice: `response.url()` gives the *final* URL after following any redirects!
-    let filename = determine_filename(response.headers(), response.url());
-    let total_size = response.content_length();
-
-    println!("Saving to:   {}", filename);
-    if let Some(total) = total_size {
-        println!("File size:   {}", HumanBytes(total));
+    // 2. Determine target filename and destination path
+    let filename = if let Some(ref path) = config.output_path {
+        path.clone()
     } else {
-        println!("File size:   Unknown (server did not send Content-Length)");
+        PathBuf::from(&probe.filename)
+    };
+
+    println!("Target URL:   {}", probe.final_url);
+    println!("Destination:  {}", filename.display());
+    if let Some(total) = probe.total_size {
+        println!("File Size:    {}", HumanBytes(total));
+    } else {
+        println!("File Size:    Unknown (chunked / dynamic stream)");
     }
-
-    // Warn if a file with the same name already exists in the current directory
-    if Path::new(&filename).exists() {
-        println!("Notice:      File '{}' already exists and will be overwritten.", filename);
-    }
-
-    // ------------------------------------------------------------------------
-    // Step 4: Open Local File for Asynchronous Writing
-    // ------------------------------------------------------------------------
-    // `tokio::fs::File::create` creates the file asynchronously without blocking the thread.
-    let mut file = File::create(&filename)
-        .await
-        .with_context(|| format!("Failed to create local file '{}'", filename))?;
-
-    // ------------------------------------------------------------------------
-    // Step 5: Configure and Start the Progress Bar
-    // ------------------------------------------------------------------------
-    let pb = setup_progress_bar(total_size)?;
-
-    // ------------------------------------------------------------------------
-    // Step 6: Stream Response to Disk in Chunks
-    // ------------------------------------------------------------------------
-    // CRITICAL DESIGN POINT:
-    // Instead of calling `response.bytes().await` (which buffers the ENTIRE file
-    // in RAM, easily crashing the program on large files like videos or ISOs),
-    // we use `response.chunk().await` in a loop.
-    //
-    // Each chunk (typically 8KB - 64KB) is:
-    // 1. Received from the network socket asynchronously
-    // 2. Written immediately to disk
-    // 3. Used to update the progress bar
-    // 4. Dropped from memory
-    let mut mut_response = response;
-    let mut downloaded_bytes: u64 = 0;
-
-    while let Some(chunk) = mut_response
-        .chunk()
-        .await
-        .context("Error encountered while receiving stream data from server")?
-    {
-        // Write the chunk to disk asynchronously
-        file.write_all(&chunk)
-            .await
-            .with_context(|| format!("Failed to write chunk to file '{}'", filename))?;
-
-        let chunk_len = chunk.len() as u64;
-        downloaded_bytes += chunk_len;
-
-        // Advance the progress bar counter
-        pb.inc(chunk_len);
-    }
-
-    // Flush any OS write buffers to ensure all bytes are physically written to disk
-    file.flush()
-        .await
-        .with_context(|| format!("Failed to flush file '{}'", filename))?;
-
-    // ------------------------------------------------------------------------
-    // Step 7: Completion
-    // ------------------------------------------------------------------------
-    pb.finish_and_clear();
     println!(
-        "\n Download completed successfully: '{}' ({})",
-        filename,
-        HumanBytes(downloaded_bytes)
+        "Range Support: {}",
+        if probe.supports_ranges { "Yes (Accept-Ranges: bytes)" } else { "No" }
     );
 
-    Ok(())
+    // 3. Select download strategy
+    match (probe.supports_ranges, probe.total_size) {
+        (true, Some(total_size)) if total_size > 0 => {
+            // Attempt segmented parallel download
+            match download_segmented(
+                &client,
+                &probe.final_url,
+                &filename,
+                total_size,
+                config.chunk_size,
+                config.connections,
+            )
+            .await
+            {
+                Ok(()) => {
+                    println!(
+                        "\n Segmented download completed successfully: '{}' ({})",
+                        filename.display(),
+                        HumanBytes(total_size)
+                    );
+                    Ok(())
+                }
+                Err(ChunkError::ServerReturned200) => {
+                    println!("\n Notice: Server returned 200 OK instead of 206 Partial Content.");
+                    println!("Falling back to Stage 1 single-stream download ...");
+                    download_single_stream(&client, &probe.final_url, &filename, Some(total_size)).await
+                }
+                Err(ChunkError::Fatal(e)) => Err(e),
+            }
+        }
+        _ => {
+            // Fallback to single-stream directly
+            if !probe.supports_ranges {
+                println!("Server does not support range requests. Using single-stream fallback.");
+            } else {
+                println!("File size is unknown. Using single-stream fallback.");
+            }
+            download_single_stream(&client, &probe.final_url, &filename, probe.total_size).await
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+    let config = CliConfig::parse_from_args(&args)?;
+
+    let Some(config) = config else {
+        return Ok(());
+    };
+
+    run_downloader(config).await
 }
 
 // ============================================================================
-// SECTION 4: Unit Tests
+// Unit & Integration Tests
 // ============================================================================
-// In Rust, tests are usually placed at the bottom in a `tests` module.
-// Run with: `cargo test`
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
-    #[test]
-    fn test_sanitize_filename() {
-        assert_eq!(sanitize_filename("test.txt"), Some("test.txt".to_string()));
-        assert_eq!(sanitize_filename("\"quoted.zip\""), Some("quoted.zip".to_string()));
-        // Strips path traversal sequences
-        assert_eq!(sanitize_filename("../../etc/passwd"), Some("passwd".to_string()));
-        assert_eq!(sanitize_filename("C:\\Windows\\System32\\cmd.exe"), Some("cmd.exe".to_string()));
-        // Disallows empty or root
-        assert_eq!(sanitize_filename(""), None);
-        assert_eq!(sanitize_filename(".."), None);
-        assert_eq!(sanitize_filename("."), None);
+    /// Options to configure the behavior of the test HTTP mock server.
+    #[derive(Default, Clone)]
+    pub struct MockServerOptions {
+        /// If true, always return 200 OK instead of 206 Partial Content.
+        pub force_no_ranges: bool,
+        /// If true, abruptly close the socket after sending only partial data on the first chunk request.
+        pub drop_mid_chunk_first_attempt: bool,
+        /// If true, return a Content-Range header that does not match the client's requested bounds.
+        pub mismatched_content_range: bool,
     }
 
-    #[test]
-    fn test_parse_content_disposition_regular() {
-        let header = r#"attachment; filename="archive.tar.gz""#;
-        assert_eq!(parse_content_disposition(header), Some("archive.tar.gz".to_string()));
+    /// Spawns a lightweight local HTTP mock server supporting Range requests.
+    async fn start_mock_server(
+        data: Arc<Vec<u8>>,
+        options: MockServerOptions,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_url = format!("http://127.0.0.1:{}/testfile", port);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let unquoted = "attachment; filename=image.png";
-        assert_eq!(parse_content_disposition(unquoted), Some("image.png".to_string()));
+        let dropped_once = Arc::new(AtomicBool::new(false));
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
+                    accept_res = listener.accept() => {
+                        let (mut socket, _) = match accept_res {
+                            Ok(s) => s,
+                            Err(_) => break,
+                        };
+                        let data = Arc::clone(&data);
+                        let options = options.clone();
+                        let dropped_once = Arc::clone(&dropped_once);
+
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 4096];
+                            let n = match socket.read(&mut buf).await {
+                                Ok(n) if n > 0 => n,
+                                _ => return,
+                            };
+
+                            let req_str = String::from_utf8_lossy(&buf[..n]);
+                            let mut lines = req_str.lines();
+                            let req_line = lines.next().unwrap_or("");
+                            let parts: Vec<&str> = req_line.split_whitespace().collect();
+                            if parts.is_empty() {
+                                return;
+                            }
+                            let method = parts[0];
+
+                            let mut range_header: Option<String> = None;
+                            for line in lines {
+                                if let Some(val) = line.strip_prefix("range: ").or_else(|| line.strip_prefix("Range: ")) {
+                                    range_header = Some(val.trim().to_string());
+                                }
+                            }
+
+                            let total_len = data.len();
+
+                            if method == "HEAD" {
+                                if options.force_no_ranges {
+                                    let response = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                        total_len
+                                    );
+                                    let _ = socket.write_all(response.as_bytes()).await;
+                                } else {
+                                    let response = format!(
+                                        "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                        total_len
+                                    );
+                                    let _ = socket.write_all(response.as_bytes()).await;
+                                }
+                            } else if method == "GET" {
+                                if !options.force_no_ranges && range_header.as_deref().unwrap_or("").starts_with("bytes=") {
+                                    let range_val = range_header.unwrap();
+                                    let range_spec = range_val.trim_start_matches("bytes=");
+                                    if let Some((start_s, end_s)) = range_spec.split_once('-') {
+                                        let start: usize = start_s.parse().unwrap_or(0);
+                                        let end: usize = end_s.parse().unwrap_or(total_len.saturating_sub(1));
+                                        let end = std::cmp::min(end, total_len.saturating_sub(1));
+
+                                        if start <= end && start < total_len {
+                                            // Case A: Simulated Mismatched Content-Range
+                                            if options.mismatched_content_range {
+                                                let header = format!(
+                                                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 99999-99999/{}\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+                                                    total_len
+                                                );
+                                                let _ = socket.write_all(header.as_bytes()).await;
+                                                let _ = socket.write_all(&[42]).await;
+                                                return;
+                                            }
+
+                                            // Case B: Simulated Connection Drop Mid-Chunk on First Attempt
+                                            if options.drop_mid_chunk_first_attempt && !dropped_once.swap(true, Ordering::SeqCst) {
+                                                let slice = &data[start..=end];
+                                                let header = format!(
+                                                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                                    start, end, total_len, slice.len()
+                                                );
+                                                let _ = socket.write_all(header.as_bytes()).await;
+
+                                                // Send only a partial fragment, then abruptly shutdown socket
+                                                let partial_len = std::cmp::min(10, slice.len() / 2);
+                                                let _ = socket.write_all(&slice[..partial_len]).await;
+                                                let _ = socket.shutdown().await;
+                                                return;
+                                            }
+
+                                            // Normal successful 206 Partial Content response
+                                            let slice = &data[start..=end];
+                                            let header = format!(
+                                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                                start, end, total_len, slice.len()
+                                            );
+                                            let _ = socket.write_all(header.as_bytes()).await;
+                                            let _ = socket.write_all(slice).await;
+                                            return;
+                                        }
+                                    }
+                                }
+
+                                // Fallback normal 200 OK response
+                                let header = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    total_len
+                                );
+                                let _ = socket.write_all(header.as_bytes()).await;
+                                let _ = socket.write_all(&data).await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        (server_url, shutdown_tx)
     }
 
-    #[test]
-    fn test_parse_content_disposition_extended_utf8() {
-        // RFC 5987 / 6266 extended syntax with percent-encoding
-        let header = "attachment; filename*=UTF-8''my%20document.pdf";
-        assert_eq!(parse_content_disposition(header), Some("my document.pdf".to_string()));
+    /// Helper to run an integration test against the mock server with configurable options.
+    async fn run_test_download_with_options(
+        test_size: usize,
+        chunk_size: u64,
+        connections: usize,
+        options: MockServerOptions,
+    ) -> Result<()> {
+        let source_data: Vec<u8> = (0..test_size).map(|i| (i * 31 % 251) as u8).collect();
+        let source_data_arc = Arc::new(source_data.clone());
 
-        // Extended takes precedence over regular
-        let both = r#"attachment; filename="fallback.pdf"; filename*=UTF-8''special%20name.pdf"#;
-        assert_eq!(parse_content_disposition(both), Some("special name.pdf".to_string()));
+        let (server_url, _shutdown) = start_mock_server(source_data_arc, options).await;
+
+        static TEST_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique_id = TEST_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let temp_filename = format!(
+            "test_output_{}_{}_{}_{}.bin",
+            test_size,
+            std::process::id(),
+            unique_id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let temp_path = PathBuf::from(&temp_filename);
+
+        let config = CliConfig {
+            url: server_url,
+            connections,
+            chunk_size,
+            output_path: Some(temp_path.clone()),
+        };
+
+        let result = run_downloader(config).await;
+
+        if result.is_ok() {
+            let downloaded_bytes = tokio::fs::read(&temp_path)
+                .await
+                .expect("Downloaded file should be readable on success");
+
+            assert_eq!(
+                downloaded_bytes.len(),
+                source_data.len(),
+                "Downloaded file size does not match source!"
+            );
+            assert_eq!(
+                downloaded_bytes, source_data,
+                "Downloaded file bytes do not match source byte-for-byte!"
+            );
+        }
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        result
     }
 
-    #[test]
-    fn test_parse_url_filename() {
-        let url1 = Url::parse("https://example.com/downloads/setup.exe").unwrap();
-        assert_eq!(parse_url_filename(&url1), Some("setup.exe".to_string()));
+    // --- Standard Integration Tests ---
 
-        let url2 = Url::parse("https://example.com/files/hello%20world.txt?query=123").unwrap();
-        assert_eq!(parse_url_filename(&url2), Some("hello world.txt".to_string()));
-
-        let url_no_file = Url::parse("https://example.com/").unwrap();
-        assert_eq!(parse_url_filename(&url_no_file), None);
+    #[tokio::test]
+    async fn test_integration_smaller_than_chunk_size() {
+        let options = MockServerOptions::default();
+        run_test_download_with_options(15 * 1024, 64 * 1024, 4, options)
+            .await
+            .expect("Should succeed");
     }
 
-    #[test]
-    fn test_determine_filename_fallback() {
-        let headers = HeaderMap::new();
-        let url = Url::parse("https://example.com/").unwrap();
-        assert_eq!(determine_filename(&headers, &url), "downloaded_file");
+    #[tokio::test]
+    async fn test_integration_not_divisible_by_chunk_size() {
+        let options = MockServerOptions::default();
+        run_test_download_with_options(150 * 1024, 64 * 1024, 4, options)
+            .await
+            .expect("Should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_integration_exact_multiple_of_chunk_size() {
+        let options = MockServerOptions::default();
+        run_test_download_with_options(128 * 1024, 64 * 1024, 4, options)
+            .await
+            .expect("Should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_integration_arbitrary_odd_size() {
+        let options = MockServerOptions::default();
+        run_test_download_with_options(333, 1024, 4, options)
+            .await
+            .expect("Should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_integration_fallback_when_ranges_unsupported() {
+        let mut options = MockServerOptions::default();
+        options.force_no_ranges = true;
+        run_test_download_with_options(75 * 1024, 16 * 1024, 4, options)
+            .await
+            .expect("Fallback to single-stream should succeed");
+    }
+
+    // --- New Tests (Requirement 4) ---
+
+    /// Tests that when a connection drops mid-chunk on the first attempt,
+    /// the worker detects the dropped connection as a retryable error, rolls back
+    /// the progress counter, retries the chunk from the start, and completes
+    /// the download with byte-identical output.
+    #[tokio::test]
+    async fn test_integration_dropped_connection_retry() {
+        let mut options = MockServerOptions::default();
+        options.drop_mid_chunk_first_attempt = true;
+
+        run_test_download_with_options(64 * 1024, 32 * 1024, 2, options)
+            .await
+            .expect("Download should recover from dropped connection and succeed on retry");
+    }
+
+    /// Tests that when a server returns a mismatched Content-Range header,
+    /// the downloader rejects it immediately as a fatal error without retrying.
+    #[tokio::test]
+    async fn test_integration_mismatched_content_range() {
+        let mut options = MockServerOptions::default();
+        options.mismatched_content_range = true;
+
+        let result = run_test_download_with_options(64 * 1024, 32 * 1024, 2, options).await;
+        assert!(result.is_err(), "Download must fail when Content-Range is mismatched");
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Content-Range mismatch"),
+            "Error message should clearly identify the Content-Range mismatch: '{}'",
+            err_msg
+        );
     }
 }

@@ -1,58 +1,62 @@
-# IDM - Rust CLI File Downloader
+# IDM - Rust Parallel Segmented CLI File Downloader
 
-An asynchronous, streaming command-line file downloader written in Rust, built with **Reqwest**, **Tokio**, and **Indicatif**.
+A high-performance, asynchronous, parallel segmented file downloader written in Rust, built with **Reqwest**, **Tokio**, and **Indicatif**.
 
 ---
 
 ## Features
 
-- **Chunked Asynchronous Streaming**: Streams data from the network directly into disk storage via `tokio::fs::File`, preventing high memory usage even when downloading multi-gigabyte files.
-- **Intelligent Filename Detection**:
-  - Automatically parses `Content-Disposition` headers (`filename` and RFC 5987/6266 `filename*`).
-  - Falls back to the URL's last path segment (handling URL encoding).
+- **HTTP Probing & Range Capability Detection**:
+  - Sends a `HEAD` request to inspect `Content-Length`, `Accept-Ranges: bytes`, `ETag`, and `Last-Modified`.
+  - If `HEAD` is unsupported or lacks headers, falls back to `GET` with `Range: bytes=0-0` and parses the total size from `Content-Range`.
+  - Automatically selects segmented download if supported, or falls back to single-stream.
+- **Segmented Parallel Downloads**:
+  - Preallocates disk file to the full size using `file.set_len(total_size)` to reduce fragmentation.
+  - Divides the file into fixed-size chunks (default 4 MiB) with inclusive HTTP range bounds (`bytes=start-end`).
+  - Distributes chunks across an asynchronous work queue using configurable concurrent worker connections (default 8, via `--connections`).
+  - Each worker opens its own file handle, seeks to its byte offset, requires `206 Partial Content`, verifies `Content-Range`, and streams chunks directly to disk.
+- **Graceful Single-Stream Fallback**:
+  - If ranges are unsupported, file size is unknown, or the server returns `200 OK` instead of `206 Partial Content`, immediately aborts segmented mode and falls back to Stage 1 sequential streaming.
+- **Retries with Exponential Backoff**:
+  - Automatically retries failed chunks up to 5 times with exponential backoff (100ms, 200ms, 400ms, 800ms, 1600ms), restarting each failed chunk from its beginning and rolling back the byte counter.
+- **Shared Atomic Progress Tracking**:
+  - Uses a single `indicatif` progress bar driven by a shared `Arc<AtomicU64>` counter showing bytes done, total size, transfer speed, and ETA.
+- **Intelligent Filename Detection & Security**:
+  - Detects filenames from `Content-Disposition` (RFC 6266 / RFC 5987 `filename*` and `filename`) or the URL path.
   - Sanitizes filenames against directory traversal vulnerabilities (`../`).
-  - Fallback default to `downloaded_file`.
-- **Dynamic Progress Bar**:
-  - Shows an animated spinner, elapsed time, byte counts (`{bytes}/{total_bytes}`), transfer speed (`{bytes_per_sec}`), and ETA (`{eta}`).
-  - Automatically falls back to an unbounded spinner if the server uses chunked transfer encoding (no `Content-Length`).
-- **Robust Error Handling**: Uses `anyhow` for actionable, context-rich error reporting.
-- **Beginner-Friendly Codebase**: Clean, documented code in `src/main.rs` with detailed inline comments and automated unit tests.
-
----
-
-## Prerequisites
-
-- [Rust & Cargo](https://www.rust-lang.org/tools/install) (Rust 1.75+ recommended)
+- **Comprehensive Test Suite**:
+  - Includes unit tests and integration tests running against a local asynchronous HTTP mock server that handles Range requests, testing various file sizes and fallback behaviors.
 
 ---
 
 ## How to Build & Run
 
-### 1. Run directly with Cargo
+### 1. Basic Download (default 8 connections, 4 MiB chunks)
 ```bash
-cargo run -- <URL>
+cargo run -- https://speed.hetzner.de/100MB.bin
 ```
 
-#### Examples:
+### 2. Custom Connections & Chunk Size
 ```bash
-# Download from URL path
-cargo run -- https://raw.githubusercontent.com/rust-lang/rust/master/README.md
+# 16 concurrent connections
+cargo run -- --connections 16 https://speed.hetzner.de/100MB.bin
 
-# Download test file with Content-Disposition header
-cargo run -- "https://httpbin.org/response-headers?Content-Disposition=attachment%3B%20filename%3D%22sample.txt%22"
+# Short flags (-c for connections, -s for chunk size in bytes)
+cargo run -- -c 4 -s 1048576 https://speed.hetzner.de/100MB.bin
 ```
 
-### 2. Run Automated Tests
+### 3. Custom Output File
+```bash
+cargo run -- -o my_download.bin https://speed.hetzner.de/100MB.bin
+```
+
+### 4. Run Automated Tests
 ```bash
 cargo test
 ```
 
-### 3. Build Release Binary
-To build an optimized binary:
+### 5. Build Release Binary
 ```bash
 cargo build --release
-```
-The compiled executable will be located at:
-```bash
-./target/release/idm <URL>
+./target/release/idm --help
 ```
